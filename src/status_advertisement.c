@@ -382,8 +382,12 @@ static struct zmk_status_adv_data manufacturer_data; // Use structured data dire
 //   FORCE_NAME_IN_AD available (cormoran fork): name in AD → SD free for manufacturer
 //   FORCE_NAME_IN_AD absent (upstream Zephyr): name in SD → manufacturer must go in AD
 // Without this separation, 28-byte manufacturer + name in SD exceeds 31-byte limit → name truncated
-#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
-// Newer Zephyr: ZMK uses FORCE_NAME_IN_AD → name in AD, SD free for manufacturer data
+// cormoran Zephyr (west.yml 锁定 v4.1.0+zmk-fixes+nrf-half-duplex-uart) 一定提供
+// BT_LE_ADV_OPT_FORCE_NAME_IN_AD（ZMK 的 ZMK_ADV_CONN_NAME 也在用它），因此这里
+// 无条件采用 "name in AD" 方案：AD 放 ZMK 完整数据（appearance+flags+HID/BAS UUID），
+// SCAN_RSP 放 28 字节 manufacturer。注意：FORCE_NAME_IN_AD / SCANNABLE 在 cormoran
+// Zephyr 中是 enum 常量而非宏，不能用 #if defined() 判断（永远为假），否则会退化成
+// 无 HID UUID、无名字的广播，导致电脑搜不到设备。
 static struct bt_data zmk_ad_restore[] = {
     BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, BT_BYTES_LIST_LE16(CONFIG_BT_DEVICE_APPEARANCE)),
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -395,9 +399,6 @@ static struct bt_data zmk_ad_restore[] = {
 static struct bt_data piggyback_sd[] = {
     BT_DATA(BT_DATA_MANUFACTURER_DATA, (uint8_t *)&manufacturer_data, sizeof(manufacturer_data)),
 };
-#endif
-// Older Zephyr (no FORCE_NAME_IN_AD): piggyback uses prospector_ad for AD, NULL for SD.
-// Zephyr auto-appends device name to SD. Scanner gets manufacturer from AD, name from SD.
 
 // --- MODE 2: Own non-connectable ADV data ---
 static struct bt_data prospector_ad[] = {
@@ -421,11 +422,7 @@ static struct bt_data name_ad[] = {
 // SCANNABLE + USE_NAME: scanner can get device name via SCAN_RSP
 // Without SCANNABLE, ADV_NONCONN_IND has no SCAN_RSP → name never reaches scanner
 static const struct bt_le_adv_param prospector_adv_params = {
-#if defined(BT_LE_ADV_OPT_SCANNABLE)
     .options = BT_LE_ADV_OPT_SCANNABLE | BT_LE_ADV_OPT_USE_NAME,
-#else
-    .options = 0,  // Fallback for older Zephyr without SCANNABLE
-#endif
     .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,  // 100ms
     .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,  // 150ms
 };
@@ -443,12 +440,7 @@ static const struct bt_le_adv_param prospector_adv_params = {
 // AD (see zmk_ad_restore below) the PC would NOT recognize the keyboard
 // during profile switching (symptom: "other channels cannot be found").
 static const struct bt_le_adv_param proxy_connectable_params = {
-#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
     .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD,
-#else
-    // Older Zephyr: name goes to SD automatically; keep manufacturer in AD.
-    .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
-#endif
     .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,  // 100ms
     .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,  // 150ms
 };
@@ -998,7 +990,6 @@ static void adv_work_handler(struct k_work *work) {
                              name_ad[1].data_len > 0;
 
             int err;
-#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
             if (prospector_adv_connectable) {
                 // Connectable proxy ADV must keep ZMK's full AD (HID/BAS
                 // UUIDs) so the host keeps recognizing the keyboard.
@@ -1006,9 +997,7 @@ static void adv_work_handler(struct k_work *work) {
                 // name swap here; keep manufacturer in SCAN_RSP.
                 err = bt_le_adv_update_data(zmk_ad_restore, ARRAY_SIZE(zmk_ad_restore),
                                             piggyback_sd, ARRAY_SIZE(piggyback_sd));
-            } else
-#endif
-            if (send_name) {
+            } else if (send_name) {
                 err = bt_le_adv_update_data(name_ad, ARRAY_SIZE(name_ad), NULL, 0);
                 if (err == 0) {
                     LOG_DBG("📡 Name-in-AD sent: \"%s\"", name_adv_buffer);
@@ -1029,16 +1018,11 @@ static void adv_work_handler(struct k_work *work) {
 
     if (!prospector_adv_active) {
         // Try piggyback on ZMK's advertising
-#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
-        // Newer Zephyr: ZMK puts name in AD → SD is free for manufacturer data
+        // cormoran Zephyr: ZMK puts name in AD (FORCE_NAME_IN_AD) → SD is free
+        // for manufacturer data. 不要用 #if defined(FORCE_NAME_IN_AD) 判断：
+        // 它是 enum 常量，defined() 恒为假，会导致退回无 HID UUID 的旧方案。
         int err = bt_le_adv_update_data(zmk_ad_restore, ARRAY_SIZE(zmk_ad_restore),
                                         piggyback_sd, ARRAY_SIZE(piggyback_sd));
-#else
-        // Older Zephyr: name goes in SD → put manufacturer in AD to avoid truncation
-        // (31-byte SD can't hold both 28-byte manufacturer data AND device name)
-        int err = bt_le_adv_update_data(prospector_ad, ARRAY_SIZE(prospector_ad),
-                                        NULL, 0);
-#endif
 
         if (err == 0) {
             if (!zmk_adv_was_active) {
@@ -1086,15 +1070,9 @@ static void adv_work_handler(struct k_work *work) {
                 // 28-byte manufacturer payload in SCAN_RSP (piggyback_sd).
                 // This is what makes profile switching discoverable: without
                 // HID UUID in AD the host ignores the device entirely.
-#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
                 err = bt_le_adv_start(&proxy_connectable_params,
                                       zmk_ad_restore, ARRAY_SIZE(zmk_ad_restore),
                                       piggyback_sd, ARRAY_SIZE(piggyback_sd));
-#else
-                err = bt_le_adv_start(&proxy_connectable_params,
-                                      prospector_ad, ARRAY_SIZE(prospector_ad),
-                                      NULL, 0);
-#endif
                 if (err == 0) {
                     prospector_adv_active = true;
                     prospector_adv_connectable = true;
