@@ -92,7 +92,9 @@ LOG_MODULE_DECLARE(zmk, CONFIG_ZMK_LOG_LEVEL);
 #include <zmk/events/position_state_changed.h>
 #include <zmk/events/ble_active_profile_changed.h>
 #include <zmk/events/layer_state_changed.h>
+#include <zmk/events/keycode_state_changed.h>
 #include <zmk/event_manager.h>
+#include <zmk/keys.h>
 
 #if IS_ENABLED(CONFIG_ZMK_SPLIT_BLE) && IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
 // No additional includes needed - zmk_peripheral_battery_state_changed is in battery_state_changed.h
@@ -189,6 +191,103 @@ static int position_state_listener(const zmk_event_t *eh) {
 
 ZMK_LISTENER(prospector_position_listener, position_state_listener);
 ZMK_SUBSCRIPTION(prospector_position_listener, zmk_position_state_changed);
+
+// ---------------------------------------------------------------------------
+// Typed keys tracking (ported from S7venYoung's typed_keys_status widget).
+// Keeps the last up-to-5 typed letters (A-Z) on the keyboard side and ships
+// them in the broadcast so the monitor can render "LAYERNAME TYPEDKEYS".
+// Modifier presses clear the buffer (shortcut combos are not rendered);
+// the buffer also auto-clears after 5 seconds of inactivity.
+// ---------------------------------------------------------------------------
+#define TYPED_KEYS_MAX 5
+#define HID_KEY_A 0x04
+#define HID_KEY_Z 0x1D
+#define HID_KEY_BACKSPACE 0x2A
+#define TYPED_KEYS_IDLE_TIMEOUT K_SECONDS(5)
+
+static char typed_keys[TYPED_KEYS_MAX + 1];
+static size_t typed_keys_len;
+static uint8_t pressed_modifiers_count;
+static bool shortcut_key_down;
+static struct k_work_delayable typed_keys_idle_work;
+
+static void typed_keys_clear(void) {
+    typed_keys_len = 0;
+    typed_keys[0] = '\0';
+}
+
+static void typed_keys_append(char letter) {
+    if (typed_keys_len == TYPED_KEYS_MAX) {
+        memmove(typed_keys, typed_keys + 1, TYPED_KEYS_MAX - 1);
+        typed_keys_len--;
+    }
+
+    typed_keys[typed_keys_len++] = letter;
+    typed_keys[typed_keys_len] = '\0';
+}
+
+static void typed_keys_idle_handler(struct k_work *work) {
+    ARG_UNUSED(work);
+
+    typed_keys_clear();
+
+    if (adv_started) {
+        k_work_cancel_delayable(&adv_work);
+        k_work_schedule(&adv_work, K_NO_WAIT);
+    }
+}
+
+static int keycode_state_listener(const zmk_event_t *eh) {
+    const struct zmk_keycode_state_changed *ev = as_zmk_keycode_state_changed(eh);
+    if (ev == NULL || ev->usage_page != HID_USAGE_KEY) {
+        return ZMK_EV_EVENT_BUBBLE;
+    }
+
+    bool keys_changed = false;
+
+    if (ev->state) {
+        k_work_reschedule(&typed_keys_idle_work, TYPED_KEYS_IDLE_TIMEOUT);
+    }
+
+    if (is_mod(ev->usage_page, ev->keycode)) {
+        if (ev->state) {
+            /* Start a fresh display sequence for the shortcut being entered. */
+            typed_keys_clear();
+            pressed_modifiers_count++;
+        } else if (pressed_modifiers_count > 0) {
+            pressed_modifiers_count--;
+        }
+        keys_changed = true;
+    } else if (!ev->state && shortcut_key_down) {
+        /* Releasing the shortcut's letter or number completes the action. */
+        typed_keys_clear();
+        shortcut_key_down = false;
+        keys_changed = true;
+    } else if (ev->state && ev->keycode >= HID_KEY_A && ev->keycode <= HID_KEY_Z) {
+        char letter = 'A' + (ev->keycode - HID_KEY_A);
+        typed_keys_append(letter);
+        shortcut_key_down = pressed_modifiers_count > 0;
+        keys_changed = true;
+    } else if (ev->state && pressed_modifiers_count > 0) {
+        /* Digits and other shortcut keys are not rendered, but their
+         * release must still clear the shortcut display. */
+        shortcut_key_down = true;
+        keys_changed = true;
+    } else if (ev->state && ev->keycode == HID_KEY_BACKSPACE && typed_keys_len > 0) {
+        typed_keys[--typed_keys_len] = '\0';
+        keys_changed = true;
+    }
+
+    if (keys_changed && adv_started) {
+        k_work_cancel_delayable(&adv_work);
+        k_work_schedule(&adv_work, K_NO_WAIT);
+    }
+
+    return ZMK_EV_EVENT_BUBBLE;
+}
+
+ZMK_LISTENER(prospector_keycode, keycode_state_listener);
+ZMK_SUBSCRIPTION(prospector_keycode, zmk_keycode_state_changed);
 
 // Profile change listener for immediate advertisement updates
 static int profile_changed_listener(const zmk_event_t *eh) {
@@ -382,12 +481,8 @@ static struct zmk_status_adv_data manufacturer_data; // Use structured data dire
 //   FORCE_NAME_IN_AD available (cormoran fork): name in AD → SD free for manufacturer
 //   FORCE_NAME_IN_AD absent (upstream Zephyr): name in SD → manufacturer must go in AD
 // Without this separation, 28-byte manufacturer + name in SD exceeds 31-byte limit → name truncated
-// cormoran Zephyr (west.yml 锁定 v4.1.0+zmk-fixes+nrf-half-duplex-uart) 一定提供
-// BT_LE_ADV_OPT_FORCE_NAME_IN_AD（ZMK 的 ZMK_ADV_CONN_NAME 也在用它），因此这里
-// 无条件采用 "name in AD" 方案：AD 放 ZMK 完整数据（appearance+flags+HID/BAS UUID），
-// SCAN_RSP 放 28 字节 manufacturer。注意：FORCE_NAME_IN_AD / SCANNABLE 在 cormoran
-// Zephyr 中是 enum 常量而非宏，不能用 #if defined() 判断（永远为假），否则会退化成
-// 无 HID UUID、无名字的广播，导致电脑搜不到设备。
+#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
+// Newer Zephyr: ZMK uses FORCE_NAME_IN_AD → name in AD, SD free for manufacturer data
 static struct bt_data zmk_ad_restore[] = {
     BT_DATA_BYTES(BT_DATA_GAP_APPEARANCE, BT_BYTES_LIST_LE16(CONFIG_BT_DEVICE_APPEARANCE)),
     BT_DATA_BYTES(BT_DATA_FLAGS, (BT_LE_AD_GENERAL | BT_LE_AD_NO_BREDR)),
@@ -399,6 +494,9 @@ static struct bt_data zmk_ad_restore[] = {
 static struct bt_data piggyback_sd[] = {
     BT_DATA(BT_DATA_MANUFACTURER_DATA, (uint8_t *)&manufacturer_data, sizeof(manufacturer_data)),
 };
+#endif
+// Older Zephyr (no FORCE_NAME_IN_AD): piggyback uses prospector_ad for AD, NULL for SD.
+// Zephyr auto-appends device name to SD. Scanner gets manufacturer from AD, name from SD.
 
 // --- MODE 2: Own non-connectable ADV data ---
 static struct bt_data prospector_ad[] = {
@@ -422,7 +520,11 @@ static struct bt_data name_ad[] = {
 // SCANNABLE + USE_NAME: scanner can get device name via SCAN_RSP
 // Without SCANNABLE, ADV_NONCONN_IND has no SCAN_RSP → name never reaches scanner
 static const struct bt_le_adv_param prospector_adv_params = {
+#if defined(BT_LE_ADV_OPT_SCANNABLE)
     .options = BT_LE_ADV_OPT_SCANNABLE | BT_LE_ADV_OPT_USE_NAME,
+#else
+    .options = 0,  // Fallback for older Zephyr without SCANNABLE
+#endif
     .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,  // 100ms
     .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,  // 150ms
 };
@@ -440,7 +542,12 @@ static const struct bt_le_adv_param prospector_adv_params = {
 // AD (see zmk_ad_restore below) the PC would NOT recognize the keyboard
 // during profile switching (symptom: "other channels cannot be found").
 static const struct bt_le_adv_param proxy_connectable_params = {
+#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
     .options = BT_LE_ADV_OPT_CONN | BT_LE_ADV_OPT_USE_NAME | BT_LE_ADV_OPT_FORCE_NAME_IN_AD,
+#else
+    // Older Zephyr: name goes to SD automatically; keep manufacturer in AD.
+    .options = BT_LE_ADV_OPT_CONNECTABLE | BT_LE_ADV_OPT_USE_NAME,
+#endif
     .interval_min = BT_GAP_ADV_FAST_INT_MIN_2,  // 100ms
     .interval_max = BT_GAP_ADV_FAST_INT_MAX_2,  // 150ms
 };
@@ -754,7 +861,6 @@ static void build_manufacturer_payload(void) {
     // Get peripheral batteries using configurable indices
     uint8_t half_battery = peripheral_batteries[CONFIG_ZMK_STATUS_ADV_HALF_PERIPHERAL];
     uint8_t aux1_battery = peripheral_batteries[CONFIG_ZMK_STATUS_ADV_AUX1_PERIPHERAL];
-    uint8_t aux2_battery = peripheral_batteries[CONFIG_ZMK_STATUS_ADV_AUX2_PERIPHERAL];
 
     /*
      * Scanner display mapping:
@@ -771,7 +877,6 @@ static void build_manufacturer_payload(void) {
         // peripheral_battery[0] (RIGHT arc) = peripheral half
         manufacturer_data.peripheral_battery[0] = half_battery;    // Right physical -> Right arc
         manufacturer_data.peripheral_battery[1] = aux1_battery;    // Aux1 (e.g., trackball)
-        manufacturer_data.peripheral_battery[2] = aux2_battery;    // Aux2
         // battery_level already has central battery, no change needed
     } else {
         // Central is on RIGHT physical side (default)
@@ -781,7 +886,6 @@ static void build_manufacturer_payload(void) {
         manufacturer_data.battery_level = half_battery;            // Left physical (peripheral) -> Left arc
         manufacturer_data.peripheral_battery[0] = central_battery; // Right physical (central) -> Right arc
         manufacturer_data.peripheral_battery[1] = aux1_battery;    // Aux1 (e.g., trackball)
-        manufacturer_data.peripheral_battery[2] = aux2_battery;    // Aux2
     }
 
 #elif IS_ENABLED(CONFIG_ZMK_SPLIT) && !IS_ENABLED(CONFIG_ZMK_SPLIT_ROLE_CENTRAL)
@@ -790,7 +894,7 @@ static void build_manufacturer_payload(void) {
 #else
     manufacturer_data.device_role = ZMK_DEVICE_ROLE_STANDALONE;
     manufacturer_data.device_index = 0;
-    memset(manufacturer_data.peripheral_battery, 0, 3);
+    memset(manufacturer_data.peripheral_battery, 0, 2);
 #endif
 
     // Compact layer name (4 bytes, NOT null-terminated, full 4 chars usable)
@@ -814,33 +918,11 @@ static void build_manufacturer_payload(void) {
              "L%d", layer % 10);
 #endif
 
-    // Keyboard ID (4 bytes) - hardware-unique ID from HWINFO (FICR on nRF52840)
-    // This ensures the same physical device always has the same ID,
-    // even when BLE MAC address changes across profile switches.
-    {
-        uint8_t hwid[16];
-        ssize_t hwid_len = hwinfo_get_device_id(hwid, sizeof(hwid));
-        uint32_t id_hash = 0;
-
-        if (hwid_len > 0) {
-            // Hash hardware device ID to 4 bytes
-            for (ssize_t i = 0; i < hwid_len; i++) {
-                id_hash = id_hash * 31 + hwid[i];
-            }
-            LOG_DBG("keyboard_id from HWINFO (%d bytes): %08X", (int)hwid_len, id_hash);
-        } else {
-            // Fallback: hash keyboard name (for boards without HWINFO)
-            const char *keyboard_name = CONFIG_ZMK_STATUS_ADV_KEYBOARD_NAME;
-            if (strlen(keyboard_name) == 0) {
-                keyboard_name = CONFIG_BT_DEVICE_NAME;
-            }
-            for (int i = 0; keyboard_name[i]; i++) {
-                id_hash = id_hash * 31 + keyboard_name[i];
-            }
-            LOG_WRN("HWINFO unavailable, using name-hash for keyboard_id: %08X", id_hash);
-        }
-        memcpy(manufacturer_data.keyboard_id, &id_hash, 4);
-    }
+    // Typed keys (up to 5 recently typed letters A-Z). Keyboard-side buffer,
+    // filled by the keycode listener; may or may not be NUL-terminated.
+    // Receiver must memcpy into a 6-byte buffer and terminate.
+    memset(manufacturer_data.typed_keys, 0, sizeof(manufacturer_data.typed_keys));
+    memcpy(manufacturer_data.typed_keys, typed_keys, typed_keys_len);
 
     // Modifier keys status - using exact YADS approach
     uint8_t modifier_flags = 0;
@@ -990,6 +1072,7 @@ static void adv_work_handler(struct k_work *work) {
                              name_ad[1].data_len > 0;
 
             int err;
+#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
             if (prospector_adv_connectable) {
                 // Connectable proxy ADV must keep ZMK's full AD (HID/BAS
                 // UUIDs) so the host keeps recognizing the keyboard.
@@ -997,7 +1080,9 @@ static void adv_work_handler(struct k_work *work) {
                 // name swap here; keep manufacturer in SCAN_RSP.
                 err = bt_le_adv_update_data(zmk_ad_restore, ARRAY_SIZE(zmk_ad_restore),
                                             piggyback_sd, ARRAY_SIZE(piggyback_sd));
-            } else if (send_name) {
+            } else
+#endif
+            if (send_name) {
                 err = bt_le_adv_update_data(name_ad, ARRAY_SIZE(name_ad), NULL, 0);
                 if (err == 0) {
                     LOG_DBG("📡 Name-in-AD sent: \"%s\"", name_adv_buffer);
@@ -1018,11 +1103,16 @@ static void adv_work_handler(struct k_work *work) {
 
     if (!prospector_adv_active) {
         // Try piggyback on ZMK's advertising
-        // cormoran Zephyr: ZMK puts name in AD (FORCE_NAME_IN_AD) → SD is free
-        // for manufacturer data. 不要用 #if defined(FORCE_NAME_IN_AD) 判断：
-        // 它是 enum 常量，defined() 恒为假，会导致退回无 HID UUID 的旧方案。
+#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
+        // Newer Zephyr: ZMK puts name in AD → SD is free for manufacturer data
         int err = bt_le_adv_update_data(zmk_ad_restore, ARRAY_SIZE(zmk_ad_restore),
                                         piggyback_sd, ARRAY_SIZE(piggyback_sd));
+#else
+        // Older Zephyr: name goes in SD → put manufacturer in AD to avoid truncation
+        // (31-byte SD can't hold both 28-byte manufacturer data AND device name)
+        int err = bt_le_adv_update_data(prospector_ad, ARRAY_SIZE(prospector_ad),
+                                        NULL, 0);
+#endif
 
         if (err == 0) {
             if (!zmk_adv_was_active) {
@@ -1070,9 +1160,15 @@ static void adv_work_handler(struct k_work *work) {
                 // 28-byte manufacturer payload in SCAN_RSP (piggyback_sd).
                 // This is what makes profile switching discoverable: without
                 // HID UUID in AD the host ignores the device entirely.
+#if defined(BT_LE_ADV_OPT_FORCE_NAME_IN_AD)
                 err = bt_le_adv_start(&proxy_connectable_params,
                                       zmk_ad_restore, ARRAY_SIZE(zmk_ad_restore),
                                       piggyback_sd, ARRAY_SIZE(piggyback_sd));
+#else
+                err = bt_le_adv_start(&proxy_connectable_params,
+                                      prospector_ad, ARRAY_SIZE(prospector_ad),
+                                      NULL, 0);
+#endif
                 if (err == 0) {
                     prospector_adv_active = true;
                     prospector_adv_connectable = true;
@@ -1133,6 +1229,7 @@ static void adv_work_handler(struct k_work *work) {
 static int init_prospector_status(PROSPECTOR_SYS_INIT_ARGS) {
     PROSPECTOR_SYS_INIT_UNUSED;
     k_work_init_delayable(&adv_work, adv_work_handler);
+    k_work_init_delayable(&typed_keys_idle_work, typed_keys_idle_handler);
 
 #if IS_ENABLED(CONFIG_ZMK_STATUS_ADV_ACTIVITY_BASED)
     LOG_INF("⚙️ PROSPECTOR: Activity-based advertisement initialized");
