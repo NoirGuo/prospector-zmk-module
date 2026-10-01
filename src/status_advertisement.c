@@ -194,22 +194,75 @@ ZMK_SUBSCRIPTION(prospector_position_listener, zmk_position_state_changed);
 
 // ---------------------------------------------------------------------------
 // Typed keys tracking (ported from S7venYoung's typed_keys_status widget).
-// Keeps the last up-to-5 typed letters (A-Z) on the keyboard side and ships
-// them in the broadcast so the monitor can render "LAYERNAME TYPEDKEYS".
-// Modifier presses clear the buffer (shortcut combos are not rendered);
+// Keeps the last up-to-5 typed characters on the keyboard side and ships them
+// in the broadcast so the monitor can render "LAYERNAME TYPEDKEYS".
+// Supported keys:
+//   - A-Z letters (rendered uppercase, as before)
+//   - Digits and US-ANSI punctuation; Shift produces the shifted symbol
+//     (e.g. Shift+1 -> '!', Shift+; -> ':')
+//   - Space -> ' '
+//   - Backspace removes the last character
+// Shift alone only changes the symbol mapping and does NOT clear the buffer;
+// Ctrl/Alt/GUI presses clear the buffer (shortcut combos are not rendered);
 // the buffer also auto-clears after 5 seconds of inactivity.
 // ---------------------------------------------------------------------------
 #define TYPED_KEYS_MAX 5
 #define HID_KEY_A 0x04
 #define HID_KEY_Z 0x1D
+#define HID_KEY_1 0x1E
+#define HID_KEY_0 0x27
 #define HID_KEY_BACKSPACE 0x2A
+#define HID_KEY_SPACE 0x2C
+#define HID_KEY_MINUS 0x2D
+#define HID_KEY_EQUAL 0x2E
+#define HID_KEY_LEFT_BRACE 0x2F
+#define HID_KEY_RIGHT_BRACE 0x30
+#define HID_KEY_BACKSLASH 0x31
+#define HID_KEY_SEMICOLON 0x33
+#define HID_KEY_QUOTE 0x34
+#define HID_KEY_GRAVE 0x35
+#define HID_KEY_COMMA 0x36
+#define HID_KEY_PERIOD 0x37
+#define HID_KEY_SLASH 0x38
+#define HID_KEY_LEFT_SHIFT 0xE1
+#define HID_KEY_RIGHT_SHIFT 0xE5
 #define TYPED_KEYS_IDLE_TIMEOUT K_SECONDS(5)
 
 static char typed_keys[TYPED_KEYS_MAX + 1];
 static size_t typed_keys_len;
 static uint8_t pressed_modifiers_count;
 static bool shortcut_key_down;
+static bool shift_pressed;
 static struct k_work_delayable typed_keys_idle_work;
+
+/* US ANSI layout: printable HID keycode -> character.
+ * Returns '\0' for keys that have no printable representation
+ * (Enter, Tab, Delete, etc.). */
+static char keycode_to_char(uint8_t keycode, bool shifted) {
+    static const char digits_low[] = "1234567890";   /* 0x1E-0x27 */
+    static const char digits_high[] = "!@#$%^&*()";
+    static const char punct_low[] = "-=[]\\;'`,./"; /* 0x2D,2E,2F,30,31,33,34,35,36,37,38 */
+    static const char punct_high[] = "_+{}|:\"~<>?";
+    static const uint8_t punct_keys[] = {
+        HID_KEY_MINUS,      HID_KEY_EQUAL,      HID_KEY_LEFT_BRACE,
+        HID_KEY_RIGHT_BRACE, HID_KEY_BACKSLASH, HID_KEY_SEMICOLON,
+        HID_KEY_QUOTE,      HID_KEY_GRAVE,      HID_KEY_COMMA,
+        HID_KEY_PERIOD,     HID_KEY_SLASH,
+    };
+
+    if (keycode >= HID_KEY_1 && keycode <= HID_KEY_0) {
+        return shifted ? digits_high[keycode - HID_KEY_1] : digits_low[keycode - HID_KEY_1];
+    }
+    if (keycode == HID_KEY_SPACE) {
+        return ' ';
+    }
+    for (size_t i = 0; i < sizeof(punct_keys); i++) {
+        if (keycode == punct_keys[i]) {
+            return shifted ? punct_high[i] : punct_low[i];
+        }
+    }
+    return '\0';
+}
 
 static void typed_keys_clear(void) {
     typed_keys_len = 0;
@@ -250,8 +303,12 @@ static int keycode_state_listener(const zmk_event_t *eh) {
     }
 
     if (is_mod(ev->usage_page, ev->keycode)) {
-        if (ev->state) {
-            /* Start a fresh display sequence for the shortcut being entered. */
+        if (ev->keycode == HID_KEY_LEFT_SHIFT || ev->keycode == HID_KEY_RIGHT_SHIFT) {
+            /* Shift only changes the symbol mapping; it does NOT start a
+             * shortcut sequence, so the typed buffer is kept. */
+            shift_pressed = ev->state;
+        } else if (ev->state) {
+            /* Ctrl/Alt/GUI start a shortcut sequence: drop the display. */
             typed_keys_clear();
             pressed_modifiers_count++;
         } else if (pressed_modifiers_count > 0) {
@@ -263,19 +320,22 @@ static int keycode_state_listener(const zmk_event_t *eh) {
         typed_keys_clear();
         shortcut_key_down = false;
         keys_changed = true;
-    } else if (ev->state && ev->keycode >= HID_KEY_A && ev->keycode <= HID_KEY_Z) {
-        char letter = 'A' + (ev->keycode - HID_KEY_A);
-        typed_keys_append(letter);
-        shortcut_key_down = pressed_modifiers_count > 0;
-        keys_changed = true;
-    } else if (ev->state && pressed_modifiers_count > 0) {
-        /* Digits and other shortcut keys are not rendered, but their
-         * release must still clear the shortcut display. */
-        shortcut_key_down = true;
-        keys_changed = true;
     } else if (ev->state && ev->keycode == HID_KEY_BACKSPACE && typed_keys_len > 0) {
         typed_keys[--typed_keys_len] = '\0';
         keys_changed = true;
+    } else if (ev->state) {
+        char ch;
+        if (ev->keycode >= HID_KEY_A && ev->keycode <= HID_KEY_Z) {
+            /* Keep the original behaviour: letters are shown uppercase. */
+            ch = 'A' + (ev->keycode - HID_KEY_A);
+        } else {
+            ch = keycode_to_char(ev->keycode, shift_pressed);
+        }
+        if (ch != '\0') {
+            typed_keys_append(ch);
+            shortcut_key_down = pressed_modifiers_count > 0;
+            keys_changed = true;
+        }
     }
 
     if (keys_changed && adv_started) {
@@ -906,9 +966,10 @@ static void build_manufacturer_payload(void) {
              "L%d", layer % 10);
 #endif
 
-    // Typed keys (up to 5 recently typed letters A-Z). Keyboard-side buffer,
-    // filled by the keycode listener; may or may not be NUL-terminated.
-    // Receiver must memcpy into a 6-byte buffer and terminate.
+    // Typed keys (up to 5 recently typed chars: letters, digits, US-ANSI
+    // symbols). Keyboard-side buffer, filled by the keycode listener; may or
+    // may not be NUL-terminated. Receiver must memcpy into a 6-byte buffer
+    // and terminate.
     memset(manufacturer_data.typed_keys, 0, sizeof(manufacturer_data.typed_keys));
     memcpy(manufacturer_data.typed_keys, typed_keys, typed_keys_len);
 
